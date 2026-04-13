@@ -1,0 +1,29 @@
+{
+  "port": 3456,
+  "defaultModel": "claude-sonnet-4-5",
+  "apiKey": "",
+  "httpProxy": "",
+
+  "models": {
+    "my-custom-alias": {
+      "kiroId": "claude-sonnet-4.5",
+      "contextWindow": 200000
+    }
+  },
+
+  "accounts": [
+    {
+      "id": "main",
+      "credsPath": "~/.aws/sso/cache/kiro-auth-token.json"
+    },
+    {
+      "id": "backup",
+      "credsPath": "~/.kiro/creds-2.json"
+    },
+    {
+      "id": "disabled-example",
+      "credsPath": "~/.kiro/creds-3.json",
+      "disabled": true
+    }
+  ]
+}

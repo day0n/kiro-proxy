@@ -6,7 +6,7 @@
  */
 
 import axios from 'axios';
-import { writeFile, mkdir } from 'fs/promises';
+import { readFile, writeFile, mkdir } from 'fs/promises';
 import { dirname } from 'path';
 import type { Credentials, AuthMethod } from '../domain/types.js';
 import { AuthenticationError } from '../domain/errors.js';
@@ -18,10 +18,17 @@ const SOCIAL_ENDPOINT = 'https://prod.{{region}}.auth.desktop.kiro.dev/refreshTo
 const IDC_ENDPOINT = 'https://oidc.{{region}}.amazonaws.com/token';
 const REFRESH_TIMEOUT = 15_000;
 
+/** Proactive refresh margin: refresh when < 10 min remaining (like AIClient-2-API) */
+const EXPIRY_NEAR_MARGIN = 10 * 60 * 1000;
+/** Hard expiry margin: token is considered expired when < 2 min remaining */
+const EXPIRY_HARD_MARGIN = 2 * 60 * 1000;
+
 export class CredentialStore {
   private creds: Partial<Credentials>;
   private filePath?: string;
   private refreshLock: Promise<void> | null = null;
+  private consecutiveFailures = 0;
+  private _needsReAuth = false;
 
   constructor(initial: Partial<Credentials>, filePath?: string) {
     this.creds = { ...initial };
@@ -32,19 +39,38 @@ export class CredentialStore {
   get region(): string { return this.creds.region ?? 'us-east-1'; }
   get authMethod(): AuthMethod { return this.creds.authMethod ?? 'social'; }
   get profileArn(): string | undefined { return this.creds.profileArn; }
+  get needsReAuth(): boolean { return this._needsReAuth; }
+  get expiresAt(): string | undefined { return this.creds.expiresAt; }
 
-  /** True if the token is missing or expires within 5 minutes */
+  /** True if the token is missing or expires within 2 minutes (hard deadline) */
   isExpired(): boolean {
     if (!this.creds.accessToken || !this.creds.expiresAt) return true;
-    const margin = 5 * 60 * 1000;
-    return Date.now() + margin >= new Date(this.creds.expiresAt).getTime();
+    return Date.now() + EXPIRY_HARD_MARGIN >= new Date(this.creds.expiresAt).getTime();
+  }
+
+  /** True if the token expires within 10 minutes — triggers proactive background refresh */
+  isExpiryNear(): boolean {
+    if (!this.creds.accessToken || !this.creds.expiresAt) return true;
+    return Date.now() + EXPIRY_NEAR_MARGIN >= new Date(this.creds.expiresAt).getTime();
   }
 
   /** Ensure we have a valid access token, refreshing if needed (mutex-protected) */
   async ensureValid(): Promise<void> {
+    if (this._needsReAuth) {
+      throw new AuthenticationError(
+        'Session expired. Please re-authenticate via POST /oauth/start'
+      );
+    }
+    // Proactive refresh: if token is near expiry, refresh in background
+    if (this.isExpiryNear() && !this.isExpired() && !this.refreshLock) {
+      logger.info('Token near expiry, proactively refreshing...');
+      this.refreshLock = this.refresh().finally(() => { this.refreshLock = null; });
+      // Don't await — let the request proceed with the still-valid token
+      return;
+    }
     if (!this.isExpired()) return;
     if (!this.creds.refreshToken) {
-      throw new AuthenticationError('No refresh token available');
+      throw new AuthenticationError('No refresh token available. Please authenticate via POST /oauth/start');
     }
     // If a refresh is already in flight, piggyback on it
     if (this.refreshLock) return this.refreshLock;
@@ -65,16 +91,36 @@ export class CredentialStore {
         : await this.refreshIdc(region);
 
       this.creds = { ...this.creds, ...result };
+      this.consecutiveFailures = 0;
+      this._needsReAuth = false;
       logger.info(`Token refreshed, expires at ${result.expiresAt}`);
 
       if (this.filePath) await this.persist();
     } catch (err: any) {
-      const msg = err?.response?.status
-        ? `Refresh failed (HTTP ${err.response.status})`
+      this.consecutiveFailures++;
+      const status = err?.response?.status;
+      const msg = status
+        ? `Refresh failed (HTTP ${status})`
         : `Refresh failed: ${err.message}`;
       logger.error(msg);
+
+      // After 3 consecutive 401s, mark as needing re-auth to stop the retry storm
+      if (status === 401 && this.consecutiveFailures >= 3) {
+        this._needsReAuth = true;
+        logger.error('Refresh token appears invalid. Marking session as expired — re-authentication required.');
+        throw new AuthenticationError(
+          'Session expired (refresh token invalid). Please re-authenticate via POST /oauth/start'
+        );
+      }
+
       throw new AuthenticationError(msg);
     }
+  }
+
+  /** Clear the re-auth flag (called after successful OAuth flow) */
+  clearReAuthFlag(): void {
+    this._needsReAuth = false;
+    this.consecutiveFailures = 0;
   }
 
   private async refreshSocial(region: string): Promise<Partial<Credentials>> {
@@ -111,12 +157,19 @@ export class CredentialStore {
     };
   }
 
-  /** Write current credentials back to the JSON file */
+  /** Write current credentials back to the JSON file (merge, don't overwrite) */
   private async persist(): Promise<void> {
     if (!this.filePath) return;
     try {
       await mkdir(dirname(this.filePath), { recursive: true });
-      await writeFile(this.filePath, JSON.stringify(this.creds, null, 2), 'utf-8');
+      // Merge with existing file data (like AIClient-2-API) to avoid losing fields
+      let existing: Record<string, unknown> = {};
+      try {
+        const raw = await readFile(this.filePath, 'utf-8');
+        existing = JSON.parse(raw);
+      } catch { /* file doesn't exist or is corrupted — start fresh */ }
+      const merged = { ...existing, ...this.creds };
+      await writeFile(this.filePath, JSON.stringify(merged, null, 2), 'utf-8');
       logger.debug(`Credentials saved to ${this.filePath}`);
     } catch (err: any) {
       logger.warn(`Failed to persist credentials: ${err.message}`);

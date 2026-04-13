@@ -43,8 +43,6 @@ export function loadCustomModels(custom: Record<string, { kiroId: string; contex
   }
 }
 
-export type ModelName = string;
-
 export function resolveKiroModelId(model: string): string {
   const entry = ModelRegistry[model];
   return entry?.kiroId ?? ModelRegistry['claude-sonnet-4-5']?.kiroId ?? 'claude-sonnet-4.5';
@@ -165,4 +163,42 @@ export interface ResolvedToolCall {
   id: string;
   name: string;
   arguments: string;
+}
+
+// ── Gateway interface ──
+
+export interface Gateway {
+  complete(req: CompletionRequest): Promise<{
+    text: string;
+    thinking: string;
+    toolCalls: ResolvedToolCall[];
+    inputTokens: number;
+    outputTokens: number;
+  }>;
+  stream(req: CompletionRequest): AsyncGenerator<DecodedEvent>;
+}
+
+// ── Credential Pool ──
+
+export interface PoolNodeConfig {
+  id: string;
+  credentials?: Partial<Credentials>;
+  credsPath?: string;
+  disabled?: boolean;
+  concurrencyLimit?: number;
+}
+
+export interface PoolNodeStatus {
+  id: string;
+  healthy: boolean;
+  disabled: boolean;
+  activeRequests: number;
+  totalRequests: number;
+  totalErrors: number;
+  lastUsed: number | null;
+  lastError: string | null;
+  cooldownUntil: number | null;
+  tokenExpiresAt: string | null;
+  authMethod: string;
+  region: string;
 }

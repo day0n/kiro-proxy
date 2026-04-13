@@ -6,8 +6,7 @@
 
 import type { ServerResponse } from 'http';
 import { v4 as uuid } from 'uuid';
-import type { CompletionRequest, ChatMessage, Tool } from '../domain/types.js';
-import { KiroGateway } from '../gateway/kiro-api.js';
+import type { CompletionRequest, ChatMessage, Tool, Gateway } from '../domain/types.js';
 import { log } from '../lib/logger.js';
 
 // ── OpenAI tools → internal tools ──
@@ -59,7 +58,7 @@ function makeChunkBase(id: string, model: string) {
 // ── Non-streaming ──
 
 async function handleNonStream(
-  gateway: KiroGateway,
+  gateway: Gateway,
   req: CompletionRequest,
   res: ServerResponse,
 ): Promise<void> {
@@ -99,7 +98,7 @@ async function handleNonStream(
 // ── Streaming ──
 
 async function handleStream(
-  gateway: KiroGateway,
+  gateway: Gateway,
   req: CompletionRequest,
   res: ServerResponse,
 ): Promise<void> {
@@ -197,7 +196,7 @@ async function handleStream(
 // ── Exported handler ──
 
 export async function handleOpenAI(
-  gateway: KiroGateway,
+  gateway: Gateway,
   body: any,
   res: ServerResponse,
 ): Promise<void> {

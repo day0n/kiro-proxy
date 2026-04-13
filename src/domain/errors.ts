@@ -30,6 +30,13 @@ export class RateLimitError extends ProxyError {
   }
 }
 
+export class ForbiddenError extends ProxyError {
+  constructor(message: string, public readonly suspended: boolean = false) {
+    super(message, 403, !suspended);
+    this.name = 'ForbiddenError';
+  }
+}
+
 export class UpstreamError extends ProxyError {
   constructor(message: string, statusCode: number = 502) {
     super(message, statusCode, true);

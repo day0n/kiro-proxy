@@ -5,8 +5,9 @@
 
 import * as http from 'http';
 import type { AppConfig } from './config.js';
-import { KiroGateway } from './gateway/kiro-api.js';
+import type { Gateway } from './domain/types.js';
 import { CredentialStore } from './auth/credential-store.js';
+import { CredentialPool } from './auth/credential-pool.js';
 import { handleClaude } from './handlers/claude.js';
 import { handleOpenAI } from './handlers/openai.js';
 import { handleModels } from './handlers/models.js';
@@ -35,7 +36,11 @@ function jsonError(res: http.ServerResponse, status: number, message: string): v
   res.end(JSON.stringify({ error: { type: 'error', message } }));
 }
 
-export function createServer(config: AppConfig, store: CredentialStore, gateway: KiroGateway): http.Server {
+export function createServer(
+  config: AppConfig,
+  gateway: Gateway,
+  ctx: { store?: CredentialStore; pool?: CredentialPool },
+): http.Server {
   return http.createServer(async (req, res) => {
     const start = Date.now();
 
@@ -48,7 +53,7 @@ export function createServer(config: AppConfig, store: CredentialStore, gateway:
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
     const path = url.pathname;
 
-    logger.debug(`→ ${req.method} ${path}`);
+    logger.debug(`\u2192 ${req.method} ${path}`);
 
     // API key check
     if (config.apiKey) {
@@ -68,6 +73,26 @@ export function createServer(config: AppConfig, store: CredentialStore, gateway:
       if (path === '/health' && req.method === 'GET') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'ok' }));
+        return;
+      }
+
+      if (path === '/pool/status' && req.method === 'GET') {
+        if (ctx.pool) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            mode: 'pool',
+            total: ctx.pool.size,
+            healthy: ctx.pool.healthyCount,
+            nodes: ctx.pool.getStatus(),
+          }));
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            mode: 'single',
+            total: 1,
+            healthy: ctx.store && !ctx.store.needsReAuth ? 1 : 0,
+          }));
+        }
         return;
       }
 
@@ -91,8 +116,14 @@ export function createServer(config: AppConfig, store: CredentialStore, gateway:
         return await handleOpenAI(gateway, body, res);
       }
 
-      // OAuth endpoints
+      // OAuth endpoints (single-credential mode only)
       if (path === '/oauth/start' && req.method === 'POST') {
+        if (ctx.pool) {
+          return jsonError(res, 400, 'OAuth not supported in pool mode \u2014 configure credentials in pool.json');
+        }
+        if (!ctx.store) {
+          return jsonError(res, 500, 'No credential store available');
+        }
         let body: any;
         try { body = JSON.parse(await readBody(req)); } catch { return jsonError(res, 400, 'Invalid JSON body'); }
         const method = body.method ?? 'google';
@@ -100,11 +131,13 @@ export function createServer(config: AppConfig, store: CredentialStore, gateway:
 
         if (method === 'google' || method === 'github') {
           const provider = method === 'github' ? 'Github' : 'Google';
-          const { authUrl, port } = await startSocialAuth(provider, store);
+          const { authUrl, port } = await startSocialAuth(provider, ctx.store);
+          ctx.store.clearReAuthFlag();
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ authUrl, port }));
         } else if (method === 'builder-id') {
-          const { verificationUrl, userCode } = await startDeviceCodeAuth(store, body.region);
+          const { verificationUrl, userCode } = await startDeviceCodeAuth(ctx.store, body.region);
+          ctx.store.clearReAuthFlag();
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ verificationUrl, userCode }));
         } else {
@@ -118,13 +151,18 @@ export function createServer(config: AppConfig, store: CredentialStore, gateway:
       jsonError(res, 404, `Not found: ${path}`);
     } catch (err: any) {
       const status = err instanceof ProxyError ? err.statusCode : 500;
-      logger.error(`[${req.method} ${path}] ${err.message}`);
+      const message = err.message;
+      logger.error(`[${req.method} ${path}] ${message}`);
       if (!res.headersSent) {
-        jsonError(res, status, err.message);
+        if (status === 401 && ctx.store?.needsReAuth) {
+          jsonError(res, 401, `${message}. Use POST /oauth/start with {"method":"builder-id"} to re-authenticate.`);
+        } else {
+          jsonError(res, status, message);
+        }
       }
     } finally {
       const ms = Date.now() - start;
-      logger.debug(`← ${req.method} ${path} ${res.statusCode} ${ms}ms`);
+      logger.debug(`\u2190 ${req.method} ${path} ${res.statusCode} ${ms}ms`);
     }
   });
 }

@@ -5,10 +5,9 @@
 
 import type { ServerResponse } from 'http';
 import { v4 as uuid } from 'uuid';
-import type { CompletionRequest, ContentBlock, ResolvedToolCall } from '../domain/types.js';
+import type { CompletionRequest, ContentBlock, ResolvedToolCall, Gateway } from '../domain/types.js';
 import { contextWindowFor } from '../domain/types.js';
-import { KiroGateway } from '../gateway/kiro-api.js';
-import { ThinkingStreamSplitter } from '../gateway/stream-decoder.js';
+import { ThinkingStreamSplitter } from '../gateway/thinking-splitter.js';
 import { estimateTokens, estimateInputFromMessages } from '../lib/text.js';
 import { log } from '../lib/logger.js';
 
@@ -66,7 +65,7 @@ function buildFullResponse(
 // ── Streaming response ──
 
 async function handleStream(
-  gateway: KiroGateway,
+  gateway: Gateway,
   req: CompletionRequest,
   res: ServerResponse,
 ): Promise<void> {
@@ -241,7 +240,7 @@ async function handleStream(
 // ── Exported handler ──
 
 export async function handleClaude(
-  gateway: KiroGateway,
+  gateway: Gateway,
   body: any,
   res: ServerResponse,
 ): Promise<void> {

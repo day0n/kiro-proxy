@@ -11,10 +11,11 @@ import * as crypto from 'crypto';
 import { v4 as uuid } from 'uuid';
 import type { CompletionRequest, DecodedEvent } from '../domain/types.js';
 import { contextWindowFor } from '../domain/types.js';
-import { AuthenticationError, RateLimitError, QuotaExhaustedError, UpstreamError } from '../domain/errors.js';
+import { AuthenticationError, RateLimitError, QuotaExhaustedError, ForbiddenError, UpstreamError } from '../domain/errors.js';
 import { CredentialStore } from '../auth/credential-store.js';
 import { buildKiroPayload } from './request-mapper.js';
-import { decodeChunk, extractBracketToolCalls, splitThinkingBlocks } from './stream-decoder.js';
+import { decodeChunk, extractBracketToolCalls } from './stream-decoder.js';
+import { splitThinkingBlocks } from './thinking-splitter.js';
 import { estimateTokens, estimateInputFromMessages } from '../lib/text.js';
 import { createLogger } from '../lib/logger.js';
 
@@ -23,7 +24,10 @@ const logger = createLogger('KIRO');
 const API_ENDPOINT = 'https://q.{{region}}.amazonaws.com/generateAssistantResponse';
 const KIRO_VERSION = '0.11.63';
 const REQUEST_TIMEOUT = 120_000;
+const STREAM_TIMEOUT = 300_000;
 const MAX_RETRIES = 3;
+
+const RETRYABLE_NETWORK_CODES = ['ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'EPIPE', 'EAI_AGAIN'];
 
 function machineFingerprint(store: CredentialStore): string {
   const seed = store.profileArn ?? 'default';
@@ -58,6 +62,7 @@ export class KiroGateway {
         'x-amzn-kiro-agent-mode': 'vibe',
         'x-amz-user-agent': `aws-sdk-js/1.0.34 KiroIDE-${KIRO_VERSION}-${fp}`,
         'user-agent': userAgentString(fp),
+        'Connection': 'close',
       },
     });
   }
@@ -88,12 +93,9 @@ export class KiroGateway {
     const inputTokens = estimateInputFromMessages(req.messages, typeof req.system === 'string' ? req.system : '');
 
     logger.info(`complete: model=${req.model}, inputTokens≈${inputTokens}`);
-    logger.debug(`complete: endpoint=${this.endpoint()}`);
 
-    const response = await this.sendWithRetry(payload);
+    const response = await this.requestWithRetry(payload, { label: 'complete' });
     const raw = Buffer.isBuffer(response.data) ? response.data.toString('utf-8') : String(response.data);
-
-    logger.debug(`complete: response length=${raw.length}`);
 
     // Decode all events from the full response
     const { events } = decodeChunk(raw);
@@ -148,96 +150,149 @@ export class KiroGateway {
 
     logger.info(`stream: model=${req.model}, endpoint=${this.endpoint()}`);
 
-    let response;
-    try {
-      response = await this.client.request({
-        method: 'POST',
-        url: this.endpoint(),
-        data: payload,
-        headers: this.authHeaders(),
-        responseType: 'stream',
-      });
-    } catch (err: any) {
-      const status = err.response?.status;
-      if (status === 401) {
-        logger.info('stream: got 401, refreshing token and retrying...');
-        await this.store.refresh();
-        response = await this.client.request({
-          method: 'POST',
-          url: this.endpoint(),
-          data: payload,
-          headers: this.authHeaders(),
-          responseType: 'stream',
-        });
-      } else if (status === 402) {
-        throw new QuotaExhaustedError('Quota exhausted');
-      } else if (status === 429) {
-        throw new RateLimitError('Rate limited');
-      } else if (status && status >= 500) {
-        throw new UpstreamError(`Server error ${status}`, status);
-      } else {
-        logger.error(`stream: request failed: ${err.message}`);
-        throw err;
-      }
-    }
-
-    logger.debug('stream: connection established, reading chunks...');
+    const response = await this.requestWithRetry(payload, {
+      responseType: 'stream',
+      timeout: STREAM_TIMEOUT,
+      label: 'stream',
+    });
 
     const nodeStream: NodeJS.ReadableStream = response.data;
     let buffer = '';
     let eventCount = 0;
+    let lastContentText: string | null = null;
 
-    for await (const chunk of nodeStream) {
-      buffer += chunk.toString();
-      const { events, remaining } = decodeChunk(buffer);
-      buffer = remaining;
+    try {
+      for await (const chunk of nodeStream) {
+        buffer += chunk.toString();
+        const { events, remaining } = decodeChunk(buffer);
+        buffer = remaining;
 
-      for (const ev of events) {
-        eventCount++;
-        yield ev;
+        for (const ev of events) {
+          // Skip consecutive duplicate content events (Kiro API sometimes sends duplicates)
+          if (ev.kind === 'text') {
+            if (ev.text === lastContentText) continue;
+            lastContentText = ev.text;
+          } else {
+            lastContentText = null;
+          }
+          eventCount++;
+          yield ev;
+        }
       }
+    } catch (err: any) {
+      if (err.code === 'ERR_STREAM_PREMATURE_CLOSE' || err.message?.includes('aborted')) {
+        logger.warn(`stream: aborted by client after ${eventCount} events`);
+        return;
+      }
+      throw err;
     }
 
     logger.info(`stream: finished, ${eventCount} events emitted`);
   }
 
-  // ── Retry logic ──
+  // ── Unified retry logic ──
 
-  private async sendWithRetry(payload: object, attempt = 0): Promise<any> {
+  private async requestWithRetry(
+    payload: object,
+    opts: { responseType?: 'stream'; timeout?: number; label: string },
+    attempt = 0,
+  ): Promise<any> {
+    const { responseType, timeout, label } = opts;
+
     try {
       return await this.client.request({
         method: 'POST',
         url: this.endpoint(),
         data: payload,
         headers: this.authHeaders(),
+        ...(responseType && { responseType }),
+        ...(timeout && { timeout }),
       });
     } catch (err: any) {
       const status = err.response?.status;
 
+      // 401 Unauthorized — refresh token once, then fail
       if (status === 401) {
         if (attempt === 0) {
-          logger.info('sendWithRetry: got 401, refreshing token...');
+          logger.info(`${label}: got 401, refreshing token and retrying...`);
           await this.store.refresh();
-          return this.sendWithRetry(payload, attempt + 1);
+          return this.requestWithRetry(payload, opts, attempt + 1);
         }
-        throw new AuthenticationError('Token refresh did not resolve 401');
+        throw new AuthenticationError('Token refresh did not resolve 401. Please re-authenticate via POST /oauth/start');
       }
-      if (status === 402) throw new QuotaExhaustedError('Quota exhausted');
+
+      // 402 Payment Required — check quota, then fail
+      if (status === 402) {
+        const limits = await this.fetchUsageLimits().catch(() => null);
+        if (limits) logger.info(`${label}: quota ${limits.usedCount}/${limits.limitCount}`);
+        throw new QuotaExhaustedError('Quota exhausted');
+      }
+
+      // 403 Forbidden — distinguish suspended accounts
+      if (status === 403) {
+        const msg = err.message ?? '';
+        const suspended = msg.toLowerCase().includes('temporarily is suspended');
+        logger.warn(`${label}: got 403${suspended ? ' (account suspended)' : ''}`);
+        throw new ForbiddenError(suspended ? 'Account temporarily suspended' : 'Forbidden', suspended);
+      }
+
+      // 429 Rate limit — retry with backoff
+      if (status === 429 && attempt < MAX_RETRIES) {
+        const retryAfter = parseInt(err.response?.headers?.['retry-after'] ?? '0', 10);
+        const delay = retryAfter > 0 ? retryAfter * 1000 : 1000 * Math.pow(2, attempt);
+        logger.warn(`${label}: rate limited (429), retry in ${delay}ms (${attempt + 1}/${MAX_RETRIES})`);
+        await new Promise(r => setTimeout(r, delay));
+        return this.requestWithRetry(payload, opts, attempt + 1);
+      }
       if (status === 429) throw new RateLimitError('Rate limited');
+
+      // 502/503 — retry with backoff
+      if ((status === 502 || status === 503) && attempt < MAX_RETRIES) {
+        const delay = 1000 * Math.pow(2, attempt);
+        logger.warn(`${label}: upstream ${status}, retry in ${delay}ms (${attempt + 1}/${MAX_RETRIES})`);
+        await new Promise(r => setTimeout(r, delay));
+        return this.requestWithRetry(payload, opts, attempt + 1);
+      }
       if (status && status >= 500) throw new UpstreamError(`Server error ${status}`, status);
 
       // Network errors — retry with backoff
-      const isNetwork = ['ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'EPIPE', 'EAI_AGAIN']
-        .includes(err.code);
-      if (isNetwork && attempt < MAX_RETRIES) {
+      if (RETRYABLE_NETWORK_CODES.includes(err.code) && attempt < MAX_RETRIES) {
         const delay = 1000 * Math.pow(2, attempt);
-        logger.warn(`Network error (${err.code}), retry in ${delay}ms (${attempt + 1}/${MAX_RETRIES})`);
+        logger.warn(`${label}: network error (${err.code}), retry in ${delay}ms (${attempt + 1}/${MAX_RETRIES})`);
         await new Promise(r => setTimeout(r, delay));
-        return this.sendWithRetry(payload, attempt + 1);
+        return this.requestWithRetry(payload, opts, attempt + 1);
       }
 
-      logger.error(`sendWithRetry: failed after ${attempt + 1} attempts: ${err.message}`);
+      logger.error(`${label}: request failed: ${err.message}`);
       throw err;
+    }
+  }
+
+  // ── Usage limits query ──
+
+  async fetchUsageLimits(): Promise<{ usedCount: number; limitCount: number } | null> {
+    const url = this.endpoint().replace('generateAssistantResponse', 'getUsageLimits');
+    const params = new URLSearchParams({
+      isEmailRequired: 'true',
+      origin: 'AI_EDITOR',
+      resourceType: 'AGENTIC_REQUEST',
+    });
+    if (this.store.authMethod === 'social' && this.store.profileArn) {
+      params.append('profileArn', this.store.profileArn);
+    }
+
+    try {
+      const { data } = await this.client.request({
+        method: 'GET',
+        url: `${url}?${params.toString()}`,
+        headers: this.authHeaders(),
+        timeout: 15_000,
+      });
+      logger.info(`getUsageLimits: ${data?.usedCount}/${data?.limitCount}`);
+      return data;
+    } catch (err: any) {
+      logger.warn(`getUsageLimits failed: ${err.message}`);
+      return null;
     }
   }
 }

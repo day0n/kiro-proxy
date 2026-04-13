@@ -71,6 +71,14 @@ function textOf(msg: ChatMessage): string {
   return typeof msg.content === 'string' ? msg.content : extractText(msg.content);
 }
 
+/** Extract only text blocks (no thinking) — used for assistant history to avoid duplication */
+function textOnlyOf(blocks: ContentBlock[]): string {
+  return blocks
+    .filter(b => b.type === 'text' && b.text)
+    .map(b => b.text!)
+    .join('');
+}
+
 function extractImages(blocks: ContentBlock[], keep: boolean): { format: string; source: { bytes: string } }[] {
   if (!keep) return [];
   return blocks
@@ -104,6 +112,24 @@ function extractToolUses(blocks: ContentBlock[]): KiroToolUseEntry[] {
     .map(b => ({ name: b.name!, toolUseId: b.id!, input: b.input ?? {} }));
 }
 
+// ── Assistant history entry builder (deduplicated) ──
+
+function buildAssistantEntry(msg: ChatMessage): { content: string; toolUses?: KiroToolUseEntry[] } {
+  const blocks = Array.isArray(msg.content) ? msg.content : [];
+  const toolUses = extractToolUses(blocks);
+  const textContent = textOnlyOf(blocks);
+  const thinkingText = blocks
+    .filter(b => b.type === 'thinking')
+    .map(b => b.thinking ?? '')
+    .join('');
+  const content = thinkingText
+    ? `<thinking>${thinkingText}</thinking>\n\n${textContent}`
+    : textContent || textOf(msg);
+  const entry: { content: string; toolUses?: KiroToolUseEntry[] } = { content };
+  if (toolUses.length) entry.toolUses = toolUses;
+  return entry;
+}
+
 // ── Merge adjacent same-role messages ──
 
 function mergeAdjacentRoles(msgs: ChatMessage[]): ChatMessage[] {
@@ -111,7 +137,6 @@ function mergeAdjacentRoles(msgs: ChatMessage[]): ChatMessage[] {
   for (const m of msgs) {
     const prev = merged[merged.length - 1];
     if (prev && prev.role === m.role) {
-      // Preserve structured content — merge into array form
       const prevBlocks = toBlocks(prev.content);
       const curBlocks = toBlocks(m.content);
       prev.content = [...prevBlocks, ...curBlocks];
@@ -127,36 +152,13 @@ function toBlocks(content: string | ContentBlock[]): ContentBlock[] {
   return content ? [{ type: 'text', text: content }] : [];
 }
 
-// ── Main mapper ──
+// ── History builder ──
 
-export function buildKiroPayload(req: CompletionRequest, profileArn?: string): KiroPayload {
-  const modelId = resolveKiroModelId(req.model);
-  const kiroTools = convertTools(req.tools);
-
-  // System prompt assembly
-  let systemText = typeof req.system === 'string'
-    ? req.system
-    : extractText(req.system as ContentBlock[] | undefined);
-
-  const thinkingPrefix = buildThinkingPrefix(req.thinking);
-  if (thinkingPrefix) {
-    systemText = systemText ? `${thinkingPrefix}\n${systemText}` : thinkingPrefix;
-  }
-
-  // Prepare messages
-  const messages = mergeAdjacentRoles(req.messages);
-  if (!messages.length) throw new Error('No messages provided');
-
-  // Strip trailing assistant message that is just "{"
-  if (messages.length > 0) {
-    const last = messages[messages.length - 1];
-    if (last.role === 'assistant' && textOf(last).trim() === '{') {
-      messages.pop();
-    }
-  }
-  if (!messages.length) throw new Error('No valid messages after filtering');
-
-  // Build history + currentMessage
+function buildHistory(
+  messages: ChatMessage[],
+  systemText: string,
+  modelId: string,
+): KiroHistoryEntry[] {
   const history: KiroHistoryEntry[] = [];
   let startIdx = 0;
 
@@ -189,26 +191,27 @@ export function buildKiroPayload(req: CompletionRequest, profileArn?: string): K
       }
       history.push({ userInputMessage: userMsg });
     } else if (msg.role === 'assistant') {
-      const toolUses = extractToolUses(blocks);
-      const entry: { content: string; toolUses?: KiroToolUseEntry[] } = { content: textOf(msg) };
-      if (toolUses.length) entry.toolUses = toolUses;
-      history.push({ assistantResponseMessage: entry });
+      history.push({ assistantResponseMessage: buildAssistantEntry(msg) });
     }
   }
 
-  // Current message (the last one)
-  let current = messages[messages.length - 1];
+  return history;
+}
+
+// ── Current message builder ──
+
+function buildCurrentMessage(
+  current: ChatMessage,
+  history: KiroHistoryEntry[],
+  modelId: string,
+  kiroTools: KiroToolDef[],
+): { currentMsg: KiroUserMsg; history: KiroHistoryEntry[] } {
   let currentContent = '';
   let currentToolResults: KiroToolResult[] = [];
   let currentImages: { format: string; source: { bytes: string } }[] = [];
 
   if (current.role === 'assistant') {
-    // Move assistant to history, create a "Continue" user message
-    const blocks = Array.isArray(current.content) ? current.content : [];
-    const toolUses = extractToolUses(blocks);
-    const entry: { content: string; toolUses?: KiroToolUseEntry[] } = { content: textOf(current) };
-    if (toolUses.length) entry.toolUses = toolUses;
-    history.push({ assistantResponseMessage: entry });
+    history.push({ assistantResponseMessage: buildAssistantEntry(current) });
     currentContent = 'Continue';
   } else {
     // Ensure history ends with an assistant message
@@ -232,16 +235,56 @@ export function buildKiroPayload(req: CompletionRequest, profileArn?: string): K
   if (currentToolResults.length) ctx.toolResults = currentToolResults;
   if (Object.keys(ctx).length) currentMsg.userInputMessageContext = ctx;
 
+  return { currentMsg, history };
+}
+
+// ── Main mapper ──
+
+export function buildKiroPayload(req: CompletionRequest, profileArn?: string): KiroPayload {
+  const modelId = resolveKiroModelId(req.model);
+  const kiroTools = convertTools(req.tools);
+
+  // System prompt assembly
+  let systemText = typeof req.system === 'string'
+    ? req.system
+    : extractText(req.system as ContentBlock[] | undefined);
+
+  const thinkingPrefix = buildThinkingPrefix(req.thinking);
+  if (thinkingPrefix) {
+    systemText = systemText ? `${thinkingPrefix}\n${systemText}` : thinkingPrefix;
+  }
+
+  // Prepare messages
+  const messages = mergeAdjacentRoles(req.messages);
+  if (!messages.length) throw new Error('No messages provided');
+
+  // Strip trailing assistant message that is just "{"
+  if (messages.length > 0) {
+    const last = messages[messages.length - 1];
+    if (last.role === 'assistant' && textOf(last).trim() === '{') {
+      messages.pop();
+    }
+  }
+  if (!messages.length) throw new Error('No valid messages after filtering');
+
+  // Build history from all messages except the last
+  const history = buildHistory(messages, systemText, modelId);
+
+  // Build current message (the last one) and finalize history
+  const result = buildCurrentMessage(
+    messages[messages.length - 1], history, modelId, kiroTools,
+  );
+
   const payload: KiroPayload = {
     conversationState: {
       agentTaskType: 'vibe',
       chatTriggerType: 'MANUAL',
       conversationId: uuid(),
-      currentMessage: { userInputMessage: currentMsg },
+      currentMessage: { userInputMessage: result.currentMsg },
     },
   };
 
-  if (history.length) payload.conversationState.history = history;
+  if (result.history.length) payload.conversationState.history = result.history;
   if (profileArn) payload.profileArn = profileArn;
 
   return payload;
