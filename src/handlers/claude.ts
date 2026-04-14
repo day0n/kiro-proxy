@@ -147,6 +147,13 @@ async function handleStream(
         continue;
       }
 
+      if (ev.kind === 'truncation' || ev.kind === 'tool_truncated') {
+        if (ev.kind === 'tool_truncated') {
+          log.warn(`Tool "${ev.name}" (${ev.toolUseId}) truncated: ${ev.diagnosis.reason}`);
+        }
+        continue;
+      }
+
       if (ev.kind === 'text') {
         if (splitter) {
           const { thinking, text } = splitter.feed(ev.text);

@@ -121,6 +121,13 @@ async function handleStream(
 
   try {
     for await (const ev of gateway.stream(req)) {
+      if (ev.kind === 'context_usage' || ev.kind === 'truncation') continue;
+
+      if (ev.kind === 'tool_truncated') {
+        log.warn(`Tool "${ev.name}" (${ev.toolUseId}) truncated: ${ev.diagnosis.reason}`);
+        continue;
+      }
+
       if (ev.kind === 'text') {
         writeChunk(res, {
           ...base,

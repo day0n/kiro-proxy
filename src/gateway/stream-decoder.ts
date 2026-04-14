@@ -7,8 +7,11 @@
  * We scan for known JSON patterns and extract complete objects.
  */
 
-import type { DecodedEvent, ResolvedToolCall } from '../domain/types.js';
+import type { DecodedEvent, ResolvedToolCall, TruncationDiagnosis } from '../domain/types.js';
 import { v4 as uuid } from 'uuid';
+import { createLogger } from '../lib/logger.js';
+
+const logger = createLogger('DECODER');
 
 // ── JSON extraction helpers ──
 
@@ -31,6 +34,46 @@ function findClosingBrace(buf: string, start: number): number {
     }
   }
   return -1; // incomplete
+}
+
+// ── Truncation diagnosis ──
+
+/**
+ * Diagnose whether a JSON string was truncated (cut off mid-stream)
+ * vs genuinely malformed. Checks for unbalanced braces/brackets and
+ * unclosed string literals.
+ */
+export function diagnoseJsonTruncation(json: string): TruncationDiagnosis {
+  const sizeBytes = Buffer.byteLength(json, 'utf-8');
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let inStr = false;
+  let esc = false;
+
+  for (let i = 0; i < json.length; i++) {
+    const ch = json[i];
+    if (esc) { esc = false; continue; }
+    if (ch === '\\' && inStr) { esc = true; continue; }
+    if (ch === '"') { inStr = !inStr; continue; }
+    if (!inStr) {
+      if (ch === '{') braceDepth++;
+      else if (ch === '}') braceDepth--;
+      else if (ch === '[') bracketDepth++;
+      else if (ch === ']') bracketDepth--;
+    }
+  }
+
+  if (inStr) {
+    return { isTruncated: true, reason: 'unclosed string literal', sizeBytes };
+  }
+  if (braceDepth > 0) {
+    return { isTruncated: true, reason: `missing ${braceDepth} closing brace(s)`, sizeBytes };
+  }
+  if (bracketDepth > 0) {
+    return { isTruncated: true, reason: `missing ${bracketDepth} closing bracket(s)`, sizeBytes };
+  }
+
+  return { isTruncated: false, reason: 'valid structure but parse failed', sizeBytes };
 }
 
 /** Known JSON-object prefixes the upstream may emit */
@@ -88,7 +131,13 @@ export function decodeChunk(buf: string): { events: DecodedEvent[]; remaining: s
         events.push({ kind: 'context_usage', percentage: obj.contextUsagePercentage });
       }
     } catch {
-      // Malformed JSON — skip
+      const diag = diagnoseJsonTruncation(json);
+      if (diag.isTruncated) {
+        logger.warn(`Truncated JSON (${diag.sizeBytes}B): ${diag.reason}`);
+        events.push({ kind: 'truncation', diagnosis: diag });
+      } else {
+        logger.debug(`Malformed JSON skipped (${diag.sizeBytes}B): ${diag.reason}`);
+      }
     }
   }
 

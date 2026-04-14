@@ -1,11 +1,31 @@
 /**
- * Thinking splitter — parses `<thinking>...</thinking>` tags from
- * Kiro API responses. Provides both one-shot splitting for non-streaming
- * and a stateful splitter for streaming scenarios.
+ * Thinking splitter — parses thinking tags from Kiro API responses.
+ * Supports multiple tag variants (<thinking>, <think>, etc.).
+ * Provides both one-shot splitting for non-streaming and a stateful
+ * splitter for streaming scenarios.
  */
 
-const THINK_OPEN = '<thinking>';
-const THINK_CLOSE = '</thinking>';
+// ── Configurable tag pairs ──
+
+const DEFAULT_TAGS: [string, string][] = [
+  ['<thinking>', '</thinking>'],
+  ['<think>', '</think>'],
+];
+
+let activeTags: [string, string][] = DEFAULT_TAGS;
+
+/** Override the active thinking tags (called from config loading) */
+export function setThinkingTags(openTags: string[]): void {
+  activeTags = openTags.map(open => [open, open.replace('<', '</')] as [string, string]);
+}
+
+function maxOpenTagLen(): number {
+  return Math.max(...activeTags.map(([o]) => o.length));
+}
+
+function maxCloseTagLen(): number {
+  return Math.max(...activeTags.map(([, c]) => c.length));
+}
 
 // ── Tag detection helpers ──
 
@@ -27,31 +47,45 @@ function findTag(text: string, tag: string, from = 0): number {
   }
 }
 
+/** Find the earliest occurrence of any active open tag. Returns [position, tagIndex] or [-1, -1]. */
+function findAnyOpenTag(text: string, from = 0): [number, number] {
+  let best = -1;
+  let bestIdx = -1;
+  for (let t = 0; t < activeTags.length; t++) {
+    const pos = findTag(text, activeTags[t][0], from);
+    if (pos >= 0 && (best < 0 || pos < best)) {
+      best = pos;
+      bestIdx = t;
+    }
+  }
+  return [best, bestIdx];
+}
+
 /**
- * Find a real </thinking> end tag that is followed by '\n\n'.
+ * Find a real end tag that is followed by '\n\n'.
  * This avoids prematurely closing a thinking block when the model
- * mentions </thinking> inside the thinking content.
+ * mentions the tag inside the thinking content.
  */
-function findRealThinkingEndTag(text: string, from = 0): number {
+function findRealEndTag(text: string, closeTag: string, from = 0): number {
   let pos = from;
   while (true) {
-    const idx = findTag(text, THINK_CLOSE, pos);
+    const idx = findTag(text, closeTag, pos);
     if (idx < 0) return -1;
-    if (text.slice(idx + THINK_CLOSE.length).startsWith('\n\n')) return idx;
+    if (text.slice(idx + closeTag.length).startsWith('\n\n')) return idx;
     pos = idx + 1;
   }
 }
 
 /**
- * Find a real </thinking> end tag at the buffer boundary — only whitespace follows.
+ * Find a real end tag at the buffer boundary — only whitespace follows.
  * Used for boundary scenarios (tool_use starts right after thinking, or stream end).
  */
-function findThinkingEndTagAtBoundary(text: string, from = 0): number {
+function findEndTagAtBoundary(text: string, closeTag: string, from = 0): number {
   let pos = from;
   while (true) {
-    const idx = findTag(text, THINK_CLOSE, pos);
+    const idx = findTag(text, closeTag, pos);
     if (idx < 0) return -1;
-    if (text.slice(idx + THINK_CLOSE.length).trim().length === 0) return idx;
+    if (text.slice(idx + closeTag.length).trim().length === 0) return idx;
     pos = idx + 1;
   }
 }
@@ -60,16 +94,16 @@ function findThinkingEndTagAtBoundary(text: string, from = 0): number {
  * Try all end-tag strategies in order: strict (\n\n), boundary (whitespace-only),
  * then plain fallback (if enough content has accumulated past the tag).
  */
-function findBestEndTag(text: string, from = 0): number {
-  let idx = findRealThinkingEndTag(text, from);
+function findBestEndTag(text: string, closeTag: string, from = 0): number {
+  let idx = findRealEndTag(text, closeTag, from);
   if (idx >= 0) return idx;
 
-  idx = findThinkingEndTagAtBoundary(text, from);
+  idx = findEndTagAtBoundary(text, closeTag, from);
   if (idx >= 0) return idx;
 
   // Fallback: accept a plain tag if buffer has 50+ chars of content past it
-  const plainIdx = findTag(text, THINK_CLOSE, from);
-  if (plainIdx >= 0 && text.length > plainIdx + THINK_CLOSE.length + 50) return plainIdx;
+  const plainIdx = findTag(text, closeTag, from);
+  if (plainIdx >= 0 && text.length > plainIdx + closeTag.length + 50) return plainIdx;
 
   return -1;
 }
@@ -81,15 +115,16 @@ function findBestEndTag(text: string, from = 0): number {
  * Used for non-streaming responses.
  */
 export function splitThinkingBlocks(text: string): { thinking: string; rest: string } {
-  const open = findTag(text, THINK_OPEN);
-  if (open < 0) return { thinking: '', rest: text };
+  const [open, tagIdx] = findAnyOpenTag(text);
+  if (open < 0 || tagIdx < 0) return { thinking: '', rest: text };
 
-  const afterOpen = open + THINK_OPEN.length;
-  const close = findBestEndTag(text, afterOpen);
+  const [openTag, closeTag] = activeTags[tagIdx];
+  const afterOpen = open + openTag.length;
+  const close = findBestEndTag(text, closeTag, afterOpen);
   if (close < 0) return { thinking: text.slice(afterOpen), rest: text.slice(0, open) };
 
   const thinking = text.slice(afterOpen, close).replace(/^\n/, '');
-  let rest = text.slice(0, open) + text.slice(close + THINK_CLOSE.length);
+  let rest = text.slice(0, open) + text.slice(close + closeTag.length);
   rest = rest.replace(/^\n\n/, '').trim();
   return { thinking, rest };
 }
@@ -103,6 +138,7 @@ export function splitThinkingBlocks(text: string): { thinking: string; rest: str
 export class ThinkingStreamSplitter {
   private buf = '';
   private phase: 'before' | 'inside' | 'after' = 'before';
+  private matchedTagIdx = -1;
 
   feed(chunk: string): { thinking: string; text: string } {
     this.buf += chunk;
@@ -110,26 +146,28 @@ export class ThinkingStreamSplitter {
     let text = '';
 
     if (this.phase === 'before') {
-      const idx = findTag(this.buf, THINK_OPEN);
-      if (idx >= 0) {
+      const [idx, tagIdx] = findAnyOpenTag(this.buf);
+      if (idx >= 0 && tagIdx >= 0) {
         text += this.buf.slice(0, idx);
-        this.buf = this.buf.slice(idx + THINK_OPEN.length).replace(/^\n/, '');
+        this.matchedTagIdx = tagIdx;
+        this.buf = this.buf.slice(idx + activeTags[tagIdx][0].length).replace(/^\n/, '');
         this.phase = 'inside';
       } else {
-        const safe = Math.max(0, this.buf.length - THINK_OPEN.length);
+        const safe = Math.max(0, this.buf.length - maxOpenTagLen());
         if (safe > 0) { text += this.buf.slice(0, safe); this.buf = this.buf.slice(safe); }
         return { thinking, text };
       }
     }
 
     if (this.phase === 'inside') {
-      const idx = findBestEndTag(this.buf);
+      const closeTag = activeTags[this.matchedTagIdx][1];
+      const idx = findBestEndTag(this.buf, closeTag);
       if (idx >= 0) {
         thinking += this.buf.slice(0, idx);
-        this.buf = this.buf.slice(idx + THINK_CLOSE.length).replace(/^\n\n/, '');
+        this.buf = this.buf.slice(idx + closeTag.length).replace(/^\n\n/, '');
         this.phase = 'after';
       } else {
-        const safe = Math.max(0, this.buf.length - THINK_CLOSE.length);
+        const safe = Math.max(0, this.buf.length - maxCloseTagLen());
         if (safe > 0) { thinking += this.buf.slice(0, safe); this.buf = this.buf.slice(safe); }
         return { thinking, text };
       }

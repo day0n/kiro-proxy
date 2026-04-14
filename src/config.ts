@@ -15,6 +15,10 @@ export interface AppConfig {
   credentials: Partial<Credentials>;
   credsPath?: string;
   poolConfig?: PoolNodeConfig[];
+  firstTokenTimeout?: number;
+  firstTokenMaxRetries?: number;
+  truncationRecovery?: boolean;
+  thinkingTags?: string[];
 }
 
 export function expandHome(p: string): string {
@@ -86,6 +90,10 @@ interface ConfigJson {
   httpProxy?: string;
   models?: Record<string, { kiroId: string; contextWindow?: number }>;
   accounts?: PoolNodeConfig[];
+  firstTokenTimeout?: number;
+  firstTokenMaxRetries?: number;
+  truncationRecovery?: boolean;
+  thinkingTags?: string[];
 }
 
 function loadConfigJson(): ConfigJson | null {
@@ -167,5 +175,9 @@ export function loadConfig(): AppConfig {
     credentials,
     credsPath,
     poolConfig: poolConfig && poolConfig.length > 1 ? poolConfig : undefined,
+    firstTokenTimeout: json?.firstTokenTimeout ?? 15000,
+    firstTokenMaxRetries: json?.firstTokenMaxRetries ?? 3,
+    truncationRecovery: json?.truncationRecovery ?? true,
+    thinkingTags: json?.thinkingTags,
   };
 }

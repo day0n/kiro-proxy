@@ -11,12 +11,25 @@ import { CredentialPool } from './auth/credential-pool.js';
 import { KiroGateway } from './gateway/kiro-api.js';
 import { PoolGateway } from './auth/pool-gateway.js';
 import { createServer } from './server.js';
+import { setThinkingTags } from './gateway/thinking-splitter.js';
 import type { Gateway } from './domain/types.js';
 import { log } from './lib/logger.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
   log.info(`Loaded config: port=${config.port}, model=${config.defaultModel}, auth=${config.credentials.authMethod ?? 'social'}`);
+
+  // Apply thinking tag config
+  if (config.thinkingTags?.length) {
+    setThinkingTags(config.thinkingTags);
+    log.info(`Thinking tags: ${config.thinkingTags.join(', ')}`);
+  }
+
+  const gwOpts = {
+    truncationRecovery: config.truncationRecovery,
+    firstTokenTimeout: config.firstTokenTimeout,
+    firstTokenMaxRetries: config.firstTokenMaxRetries,
+  };
 
   let gateway: Gateway;
   let store: CredentialStore | undefined;
@@ -26,7 +39,7 @@ async function main(): Promise<void> {
     // ── Pool mode ──
     pool = new CredentialPool(config.poolConfig);
     await pool.initAll();
-    gateway = new PoolGateway(pool);
+    gateway = new PoolGateway(pool, gwOpts);
     log.info(`Pool mode: ${pool.size} account(s), ${pool.healthyCount} healthy`);
   } else {
     // ── Single credential mode (backward compatible) ──
@@ -37,7 +50,7 @@ async function main(): Promise<void> {
     } catch (err: any) {
       log.warn(`Initial auth skipped: ${err.message} — use /oauth/start to authenticate`);
     }
-    gateway = new KiroGateway(store);
+    gateway = new KiroGateway(store, gwOpts);
   }
 
   const server = createServer(config, gateway, { store, pool });

@@ -5,7 +5,7 @@
  */
 
 import { CredentialPool } from './credential-pool.js';
-import { KiroGateway } from '../gateway/kiro-api.js';
+import { KiroGateway, type GatewayOpts } from '../gateway/kiro-api.js';
 import { CredentialStore } from './credential-store.js';
 import type { CompletionRequest, DecodedEvent, Gateway } from '../domain/types.js';
 import { ProxyError, ForbiddenError } from '../domain/errors.js';
@@ -17,15 +17,17 @@ const MAX_POOL_RETRIES = 2; // retry on up to 2 other credentials (3 total attem
 export class PoolGateway implements Gateway {
   private pool: CredentialPool;
   private gateways = new Map<string, KiroGateway>();
+  private gwOpts: GatewayOpts;
 
-  constructor(pool: CredentialPool) {
+  constructor(pool: CredentialPool, opts?: GatewayOpts) {
     this.pool = pool;
+    this.gwOpts = opts ?? {};
   }
 
   private getGateway(nodeId: string, store: CredentialStore): KiroGateway {
     let gw = this.gateways.get(nodeId);
     if (!gw) {
-      gw = new KiroGateway(store);
+      gw = new KiroGateway(store, this.gwOpts);
       this.gateways.set(nodeId, gw);
     }
     return gw;

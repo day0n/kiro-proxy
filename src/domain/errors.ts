@@ -43,3 +43,10 @@ export class UpstreamError extends ProxyError {
     this.name = 'UpstreamError';
   }
 }
+
+export class FirstTokenTimeoutError extends ProxyError {
+  constructor(message: string = 'No data received within first-token timeout') {
+    super(message, 504, true);
+    this.name = 'FirstTokenTimeoutError';
+  }
+}

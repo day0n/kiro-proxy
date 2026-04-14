@@ -148,6 +148,14 @@ export type KiroHistoryEntry =
   | { userInputMessage: KiroUserMsg }
   | { assistantResponseMessage: { content: string; toolUses?: KiroToolUseEntry[] } };
 
+// ── Truncation diagnosis ──
+
+export interface TruncationDiagnosis {
+  isTruncated: boolean;
+  reason: string;
+  sizeBytes: number;
+}
+
 // ── Decoded stream events ──
 
 export type DecodedEvent =
@@ -155,7 +163,9 @@ export type DecodedEvent =
   | { kind: 'tool_start'; name: string; toolUseId: string; input: string }
   | { kind: 'tool_delta'; input: string }
   | { kind: 'tool_end' }
-  | { kind: 'context_usage'; percentage: number };
+  | { kind: 'context_usage'; percentage: number }
+  | { kind: 'truncation'; diagnosis: TruncationDiagnosis }
+  | { kind: 'tool_truncated'; toolUseId: string; name: string; diagnosis: TruncationDiagnosis };
 
 // ── Parsed tool call (final) ──
 

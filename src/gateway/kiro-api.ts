@@ -11,10 +11,10 @@ import * as crypto from 'crypto';
 import { v4 as uuid } from 'uuid';
 import type { CompletionRequest, DecodedEvent } from '../domain/types.js';
 import { contextWindowFor } from '../domain/types.js';
-import { AuthenticationError, RateLimitError, QuotaExhaustedError, ForbiddenError, UpstreamError } from '../domain/errors.js';
+import { AuthenticationError, RateLimitError, QuotaExhaustedError, ForbiddenError, UpstreamError, FirstTokenTimeoutError } from '../domain/errors.js';
 import { CredentialStore } from '../auth/credential-store.js';
 import { buildKiroPayload } from './request-mapper.js';
-import { decodeChunk, extractBracketToolCalls } from './stream-decoder.js';
+import { decodeChunk, extractBracketToolCalls, diagnoseJsonTruncation } from './stream-decoder.js';
 import { splitThinkingBlocks } from './thinking-splitter.js';
 import { estimateTokens, estimateInputFromMessages } from '../lib/text.js';
 import { createLogger } from '../lib/logger.js';
@@ -42,12 +42,24 @@ function userAgentString(fingerprint: string): string {
   return `aws-sdk-js/1.0.34 ua/2.1 os/${osTag} lang/js md/nodejs#${nodeVer} api/codewhispererstreaming#1.0.34 m/E KiroIDE-${KIRO_VERSION}-${fingerprint}`;
 }
 
+export interface GatewayOpts {
+  truncationRecovery?: boolean;
+  firstTokenTimeout?: number;
+  firstTokenMaxRetries?: number;
+}
+
 export class KiroGateway {
   private client: AxiosInstance;
   private store: CredentialStore;
+  private truncationRecovery: boolean;
+  private firstTokenTimeout: number;
+  private firstTokenMaxRetries: number;
 
-  constructor(store: CredentialStore) {
+  constructor(store: CredentialStore, opts?: GatewayOpts) {
     this.store = store;
+    this.truncationRecovery = opts?.truncationRecovery ?? true;
+    this.firstTokenTimeout = opts?.firstTokenTimeout ?? 15000;
+    this.firstTokenMaxRetries = opts?.firstTokenMaxRetries ?? 3;
     const fp = machineFingerprint(store);
     logger.debug(`Fingerprint: ${fp.slice(0, 16)}...`);
 
@@ -106,16 +118,23 @@ export class KiroGateway {
     for (const ev of events) {
       if (ev.kind === 'text') fullText += ev.text;
       else if (ev.kind === 'tool_start') {
-        if (currentTool) toolCallsRaw.push(currentTool);
+        if (currentTool) {
+          this.validateToolArgs(currentTool);
+          toolCallsRaw.push(currentTool);
+        }
         currentTool = { id: ev.toolUseId, name: ev.name, args: ev.input };
       } else if (ev.kind === 'tool_delta' && currentTool) {
         currentTool.args += ev.input;
       } else if (ev.kind === 'tool_end' && currentTool) {
+        this.validateToolArgs(currentTool);
         toolCallsRaw.push(currentTool);
         currentTool = null;
       }
     }
-    if (currentTool) toolCallsRaw.push(currentTool);
+    if (currentTool) {
+      this.validateToolArgs(currentTool);
+      toolCallsRaw.push(currentTool);
+    }
 
     // Also check for bracket-style tool calls in text
     const { cleaned, toolCalls: bracketCalls } = extractBracketToolCalls(fullText);
@@ -142,13 +161,28 @@ export class KiroGateway {
     return { text: rest, thinking, toolCalls: allCalls, inputTokens, outputTokens };
   }
 
-  // ── Streaming call ──
+  // ── Streaming call (with first-token timeout retry) ──
 
   async *stream(req: CompletionRequest): AsyncGenerator<DecodedEvent> {
+    for (let attempt = 0; attempt <= this.firstTokenMaxRetries; attempt++) {
+      try {
+        yield* this._streamOnce(req, attempt);
+        return;
+      } catch (err) {
+        if (err instanceof FirstTokenTimeoutError && attempt < this.firstTokenMaxRetries) {
+          logger.warn(`First-token timeout (attempt ${attempt + 1}/${this.firstTokenMaxRetries}), retrying...`);
+          continue;
+        }
+        throw err;
+      }
+    }
+  }
+
+  private async *_streamOnce(req: CompletionRequest, attempt: number): AsyncGenerator<DecodedEvent> {
     await this.store.ensureValid();
     const payload = buildKiroPayload(req, this.store.profileArn);
 
-    logger.info(`stream: model=${req.model}, endpoint=${this.endpoint()}`);
+    logger.info(`stream: model=${req.model}${attempt > 0 ? `, retry=${attempt}` : ''}`);
 
     const response = await this.requestWithRetry(payload, {
       responseType: 'stream',
@@ -157,27 +191,93 @@ export class KiroGateway {
     });
 
     const nodeStream: NodeJS.ReadableStream = response.data;
+    const iterator = (nodeStream as AsyncIterable<Buffer>)[Symbol.asyncIterator]();
+
+    // First chunk with timeout — single timer controls both destroy and reject
+    let firstResult: IteratorResult<Buffer>;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+    try {
+      firstResult = await Promise.race([
+        iterator.next(),
+        new Promise<never>((_, reject) => {
+          timeoutId = setTimeout(() => {
+            if ('destroy' in nodeStream && typeof (nodeStream as any).destroy === 'function') {
+              (nodeStream as any).destroy();
+            }
+            reject(new FirstTokenTimeoutError(
+              `No data received within ${this.firstTokenTimeout}ms`
+            ));
+          }, this.firstTokenTimeout);
+        }),
+      ]);
+    } finally {
+      if (timeoutId !== null) clearTimeout(timeoutId);
+    }
+
+    if (firstResult.done) return;
+
     let buffer = '';
     let eventCount = 0;
     let lastContentText: string | null = null;
+    let currentToolName = '';
+    let currentToolId = '';
+    let currentToolArgs = '';
 
+    const processEvents = function* (this: KiroGateway, events: DecodedEvent[]): Generator<DecodedEvent> {
+      for (const ev of events) {
+        if (ev.kind === 'text') {
+          if (ev.text === lastContentText) continue;
+          lastContentText = ev.text;
+        } else {
+          lastContentText = null;
+        }
+
+        // Track tool call accumulation for truncation detection
+        if (ev.kind === 'tool_start') {
+          currentToolName = ev.name;
+          currentToolId = ev.toolUseId;
+          currentToolArgs = ev.input;
+        } else if (ev.kind === 'tool_delta') {
+          currentToolArgs += ev.input;
+        } else if (ev.kind === 'tool_end') {
+          // Validate accumulated tool call JSON
+          if (currentToolArgs && this.truncationRecovery) {
+            try {
+              JSON.parse(currentToolArgs);
+            } catch {
+              const diag = diagnoseJsonTruncation(currentToolArgs);
+              if (diag.isTruncated) {
+                logger.warn(`Stream tool "${currentToolName}" truncated (${diag.sizeBytes}B): ${diag.reason}`);
+                yield { kind: 'tool_truncated', toolUseId: currentToolId, name: currentToolName, diagnosis: diag };
+              }
+            }
+          }
+          currentToolName = '';
+          currentToolId = '';
+          currentToolArgs = '';
+        }
+
+        eventCount++;
+        yield ev;
+      }
+    }.bind(this);
+
+    // Process first chunk
+    buffer += firstResult.value.toString();
+    const first = decodeChunk(buffer);
+    buffer = first.remaining;
+    yield* processEvents(first.events);
+
+    // Remaining chunks
     try {
-      for await (const chunk of nodeStream) {
-        buffer += chunk.toString();
+      let next = await iterator.next();
+      while (!next.done) {
+        buffer += next.value.toString();
         const { events, remaining } = decodeChunk(buffer);
         buffer = remaining;
-
-        for (const ev of events) {
-          // Skip consecutive duplicate content events (Kiro API sometimes sends duplicates)
-          if (ev.kind === 'text') {
-            if (ev.text === lastContentText) continue;
-            lastContentText = ev.text;
-          } else {
-            lastContentText = null;
-          }
-          eventCount++;
-          yield ev;
-        }
+        yield* processEvents(events);
+        next = await iterator.next();
       }
     } catch (err: any) {
       if (err.code === 'ERR_STREAM_PREMATURE_CLOSE' || err.message?.includes('aborted')) {
@@ -188,6 +288,21 @@ export class KiroGateway {
     }
 
     logger.info(`stream: finished, ${eventCount} events emitted`);
+  }
+
+  // ── Tool call validation helper ──
+
+  private validateToolArgs(tool: { id: string; name: string; args: string }): void {
+    if (!tool.args || !this.truncationRecovery) return;
+    try {
+      JSON.parse(tool.args);
+    } catch {
+      const diag = diagnoseJsonTruncation(tool.args);
+      if (diag.isTruncated) {
+        logger.warn(`Tool "${tool.name}" truncated (${diag.sizeBytes}B): ${diag.reason}`);
+        tool.args = '{}';
+      }
+    }
   }
 
   // ── Unified retry logic ──
